@@ -1,4 +1,6 @@
 from __future__ import annotations
+import pytest
+import sys
 
 import json
 import subprocess
@@ -16,6 +18,7 @@ def _runner(responses, calls):
     return run
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX codex bundle path assumed")
 def test_install_reuses_configured_marketplace_and_adds_plugin(tmp_path: Path):
     calls = []
     responses = [
@@ -46,6 +49,7 @@ def test_install_reuses_configured_marketplace_and_adds_plugin(tmp_path: Path):
     ]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX codex bundle path assumed")
 def test_install_adds_missing_marketplace_before_plugin(tmp_path: Path):
     calls = []
     responses = [
@@ -72,6 +76,7 @@ def test_install_adds_missing_marketplace_before_plugin(tmp_path: Path):
     ]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX codex bundle path assumed")
 def test_install_refreshes_existing_plugin_cache(tmp_path: Path):
     calls = []
     responses = [
@@ -116,6 +121,7 @@ def test_install_refreshes_existing_plugin_cache(tmp_path: Path):
     ]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX codex bundle path assumed")
 def test_dry_run_and_uninstall_do_not_touch_marketplace(tmp_path: Path):
     calls = []
     manager = BridgePluginManager(
@@ -169,3 +175,49 @@ def test_status_reports_installed_plugin_version(tmp_path: Path):
         "version": "0.1.0+codex.test",
         "plugin_id": "loopweave-visible-bridge@loopweave-local",
     }
+
+
+def test_run_json_decodes_codex_output_as_utf8(tmp_path: Path):
+    """The codex CLI emits UTF-8 JSON (including non-ASCII paths). On a
+    Chinese Windows console the default ANSI decode is GBK and crashes on
+    multibyte output, so the runner must force UTF-8 with replacement."""
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(kwargs)
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout='{"marketplaces": [{"name": "loopweave-可见桥"}]}',
+            stderr="",
+        )
+
+    manager = BridgePluginManager(
+        codex_bin=Path("/opt/codex"),
+        marketplace_root=tmp_path,
+        runner=run,
+    )
+
+    payload = manager._run_json(["plugin", "marketplace", "list", "--json"])
+
+    assert payload["marketplaces"][0]["name"] == "loopweave-可见桥"
+    assert calls[0]["encoding"] == "utf-8"
+    assert calls[0]["errors"] == "replace"
+
+
+def test_plugin_mcp_manifest_uses_loopweave_serve():
+    """The plugin MCP command must not depend on a platform-specific
+    interpreter name: ``python3`` does not exist on Windows venvs. The
+    manifest must call the installed ``loopweave`` entry point instead."""
+    root = Path(__file__).resolve().parents[1]
+    manifest = json.loads(
+        (
+            root
+            / "plugins"
+            / "loopweave-visible-bridge"
+            / ".mcp.json"
+        ).read_text(encoding="utf-8")
+    )
+    server = manifest["mcpServers"]["loopweave-visible-bridge"]
+    assert server["command"] == "loopweave"
+    assert server["args"] == ["bridge", "serve"]
