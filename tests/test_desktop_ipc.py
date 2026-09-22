@@ -4,6 +4,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -11,8 +12,10 @@ import pytest
 
 import loopweave.desktop_ipc as desktop_ipc
 from loopweave.desktop_ipc import (
+    CURRENT_START_TURN_VERSION,
     DesktopIpcClient,
     DesktopIpcError,
+    LEGACY_START_TURN_VERSION,
     desktop_ipc_socket_path,
     encode_frame,
     read_frame,
@@ -45,10 +48,12 @@ class FakeDesktopRouter:
         *,
         start_error: str | None = None,
         expect_start: bool = True,
+        drop_start_response: bool = False,
     ) -> None:
         self.socket_path = socket_path
         self.start_error = start_error
         self.expect_start = expect_start
+        self.drop_start_response = drop_start_response
         self.messages: list[dict[str, Any]] = []
         self.failure: BaseException | None = None
         self.ready = threading.Event()
@@ -90,6 +95,9 @@ class FakeDesktopRouter:
                         return
                     start = _recv_frame(connection)
                     self.messages.append(start)
+                    if self.drop_start_response:
+                        time.sleep(0.1)
+                        return
                     if self.start_error is not None:
                         response = {
                             "type": "response",
@@ -117,6 +125,90 @@ def _bind_socket(path: Path) -> socket.socket:
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(str(path))
     return server
+
+
+class LegacyFallbackRouter:
+    """Reject the current envelope, then accept one legacy retry."""
+
+    def __init__(
+        self,
+        socket_path: Path,
+        *,
+        legacy_error: str | None = None,
+    ) -> None:
+        self.socket_path = socket_path
+        self.legacy_error = legacy_error
+        self.messages: list[dict[str, Any]] = []
+        self.failure: BaseException | None = None
+        self.ready = threading.Event()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+
+    def __enter__(self) -> "LegacyFallbackRouter":
+        self.thread.start()
+        assert self.ready.wait(timeout=2)
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.thread.join(timeout=2)
+        assert not self.thread.is_alive()
+        if self.failure is not None:
+            raise self.failure
+
+    def _serve(self) -> None:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+                server.bind(str(self.socket_path))
+                server.listen(2)
+                self.ready.set()
+                for expected_version in (
+                    CURRENT_START_TURN_VERSION,
+                    LEGACY_START_TURN_VERSION,
+                ):
+                    connection, _ = server.accept()
+                    with connection:
+                        initialize = _recv_frame(connection)
+                        self.messages.append(initialize)
+                        _send_frame(
+                            connection,
+                            {
+                                "type": "response",
+                                "requestId": initialize["requestId"],
+                                "resultType": "success",
+                                "method": "initialize",
+                                "handledByClientId": "fake-bridge-client",
+                                "result": {"clientId": "fake-bridge-client"},
+                            },
+                        )
+                        start = _recv_frame(connection)
+                        self.messages.append(start)
+                        assert start["version"] == expected_version
+                        if expected_version == CURRENT_START_TURN_VERSION:
+                            response = {
+                                "type": "response",
+                                "requestId": start["requestId"],
+                                "resultType": "error",
+                                "error": "no-client-found",
+                            }
+                        elif self.legacy_error is not None:
+                            response = {
+                                "type": "response",
+                                "requestId": start["requestId"],
+                                "resultType": "error",
+                                "error": self.legacy_error,
+                            }
+                        else:
+                            response = {
+                                "type": "response",
+                                "requestId": start["requestId"],
+                                "resultType": "success",
+                                "method": "thread-follower-start-turn",
+                                "handledByClientId": "desktop-owner",
+                                "result": {"turnId": "legacy-turn-visible"},
+                            }
+                        _send_frame(connection, response)
+        except BaseException as error:  # surfaced by __exit__
+            self.failure = error
+            self.ready.set()
 
 
 def test_socket_discovery_prefers_current_codex_home_socket(
@@ -223,9 +315,46 @@ def test_start_visible_turn_uses_owner_routed_desktop_request(
 
     assert start["type"] == "request"
     assert start["method"] == "thread-follower-start-turn"
-    assert start["version"] == 1
+    assert start["version"] == CURRENT_START_TURN_VERSION
     assert start["sourceClientId"] == "fake-bridge-client"
     assert start["params"] == {
+        "conversationId": THREAD_ID,
+        "turnStart": {
+            "request": {
+                "threadId": THREAD_ID,
+                "input": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                        "text_elements": [],
+                    }
+                ],
+            }
+        },
+    }
+
+
+def test_start_visible_turn_falls_back_only_after_definitive_no_client(
+    short_socket_path: Path,
+) -> None:
+    prompt = "[LOOPWEAVE_VISIBLE_REVIEW review_id=r generation=1]"
+    with LegacyFallbackRouter(short_socket_path) as router:
+        response = DesktopIpcClient(socket_path=short_socket_path).start_visible_turn(
+            thread_id=THREAD_ID,
+            prompt=prompt,
+        )
+
+    assert response == {"turnId": "legacy-turn-visible"}
+    starts = [
+        message
+        for message in router.messages
+        if message.get("method") == "thread-follower-start-turn"
+    ]
+    assert [message["version"] for message in starts] == [
+        CURRENT_START_TURN_VERSION,
+        LEGACY_START_TURN_VERSION,
+    ]
+    assert starts[1]["params"] == {
         "conversationId": THREAD_ID,
         "turnStartParams": {
             "threadId": THREAD_ID,
@@ -238,6 +367,45 @@ def test_start_visible_turn_uses_owner_routed_desktop_request(
             ],
         },
     }
+
+
+def test_start_visible_turn_does_not_retry_definitive_non_version_error(
+    short_socket_path: Path,
+) -> None:
+    with FakeDesktopRouter(short_socket_path, start_error="request-timeout") as router:
+        with pytest.raises(DesktopIpcError, match="request-timeout"):
+            DesktopIpcClient(socket_path=short_socket_path).start_visible_turn(
+                thread_id=THREAD_ID,
+                prompt="[LOOPWEAVE_VISIBLE_REVIEW review_id=r generation=1]",
+            )
+
+    starts = [
+        message
+        for message in router.messages
+        if message.get("method") == "thread-follower-start-turn"
+    ]
+    assert len(starts) == 1
+
+
+def test_start_visible_turn_does_not_retry_ambiguous_read_timeout(
+    short_socket_path: Path,
+) -> None:
+    with FakeDesktopRouter(short_socket_path, drop_start_response=True) as router:
+        with pytest.raises(DesktopIpcError, match="read failed"):
+            DesktopIpcClient(
+                socket_path=short_socket_path,
+                timeout_seconds=0.02,
+            ).start_visible_turn(
+                thread_id=THREAD_ID,
+                prompt="[LOOPWEAVE_VISIBLE_REVIEW review_id=r generation=1]",
+            )
+
+    starts = [
+        message
+        for message in router.messages
+        if message.get("method") == "thread-follower-start-turn"
+    ]
+    assert len(starts) == 1
 
 
 def test_probe_performs_initialize_only_read_only_handshake(
@@ -257,7 +425,7 @@ def test_start_visible_turn_fails_closed_when_no_owner_can_handle(
     short_socket_path: Path,
 ) -> None:
     socket_path = short_socket_path
-    with FakeDesktopRouter(socket_path, start_error="no-client-found"):
+    with LegacyFallbackRouter(socket_path, legacy_error="no-client-found"):
         with pytest.raises(DesktopIpcError, match="no-client-found"):
             DesktopIpcClient(socket_path=socket_path).start_visible_turn(
                 thread_id=THREAD_ID,

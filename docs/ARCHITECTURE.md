@@ -120,13 +120,15 @@ The repository contains:
 - a Claude Stop-hook adapter that translates its transcript into the shared
   submission service;
 - isolated and visible Codex review backends;
-- an optional Codex Desktop visible-review plugin.
+- an optional Codex Desktop visible-review plugin;
+- a runtime root separate from the source checkout, defaulting to
+  `~/.codex/loopweave` (overridable with `LOOPWEAVE_HOME`), with run lifecycle
+  governance, recoverable archives, and protected garbage collection.
 
 Remaining architecture debt for later packages:
 
 - a Windows ConPTY backend (today Windows fails closed, it is not supported);
-- Codex Desktop implementation details inside the review host layer;
-- runtime-state placement coupled to a source checkout by default.
+- Codex Desktop implementation details inside the review host layer.
 
 ## Non-negotiable invariants
 
@@ -135,4 +137,16 @@ Remaining architecture debt for later packages:
 - Review evidence is bounded and does not include unrestricted terminal logs.
 - Review delivery returns to the same managed session.
 - Hidden replacement workers or reviewers are not created silently.
+- Desktop start-turn delivery uses the current v2 request envelope first. A
+  legacy v1 retry is permitted only after a definitive `no-client-found`
+  response proves that no owner accepted the first request; ambiguous timeouts
+  never trigger a duplicate turn.
+- The bound visible reviewer may use a bounded, read-only evidence helper for
+  tests, static checks, screenshots/visual QA, logs, or evidence collection.
+  That helper is not a reviewer or worker identity: it cannot modify the
+  reviewed workspace/source, invoke `loopweave review-next` or
+  `loopweave review-submit`, write a verdict, operate LoopWeave run/runtime/
+  registry/state, advance a package, or replace the main reviewer's independent
+  judgment. The main reviewer independently verifies helper results and
+  personally submits the sole verdict.
 - Runtime state and user workspaces are never committed to this repository.

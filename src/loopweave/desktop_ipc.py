@@ -14,7 +14,13 @@ from typing import Any, Optional
 
 MAX_FRAME_BYTES = 16 * 1024 * 1024
 MAX_PROMPT_BYTES = 16 * 1024
-DEFAULT_TIMEOUT_SECONDS = 8.0
+# Codex Desktop's local router waits up to 10 seconds while it discovers a
+# client that owns the requested thread.  A shorter socket timeout turns the
+# router's definitive ``no-client-found`` response into an ambiguous read
+# timeout, which prevents safe protocol-version fallback.
+DEFAULT_TIMEOUT_SECONDS = 15.0
+CURRENT_START_TURN_VERSION = 2
+LEGACY_START_TURN_VERSION = 1
 DESKTOP_IPC_SOCKET_ENV = "LOOPWEAVE_DESKTOP_IPC_SOCKET"
 _THREAD_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -23,6 +29,15 @@ _THREAD_RE = re.compile(
 
 class DesktopIpcError(RuntimeError):
     pass
+
+
+class DesktopIpcRequestError(DesktopIpcError):
+    """A definitive error response returned by the Desktop IPC router."""
+
+    def __init__(self, method: str, detail: str) -> None:
+        self.method = method
+        self.detail = detail
+        super().__init__(f"Desktop IPC {method} failed: {detail}")
 
 
 def _legacy_desktop_ipc_socket_path() -> Path:
@@ -133,26 +148,73 @@ class DesktopIpcClient:
         if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
             raise DesktopIpcError("visible review prompt exceeds IPC limit")
 
+        try:
+            return self._start_visible_turn(
+                thread_id=thread_id,
+                prompt=prompt,
+                version=CURRENT_START_TURN_VERSION,
+            )
+        except DesktopIpcRequestError as error:
+            # Version mismatches are deliberately reported by Desktop's
+            # owner-discovery router as ``no-client-found``: no client claimed
+            # the request, so no turn can have started.  Only that definitive
+            # result is safe to retry with the legacy v1 envelope.  Read
+            # timeouts, disconnects, and request-timeouts remain ambiguous and
+            # must never trigger a second turn request.
+            if (
+                error.method != "thread-follower-start-turn"
+                or error.detail != "no-client-found"
+            ):
+                raise
+        return self._start_visible_turn(
+            thread_id=thread_id,
+            prompt=prompt,
+            version=LEGACY_START_TURN_VERSION,
+        )
+
+    def _start_visible_turn(
+        self,
+        *,
+        thread_id: str,
+        prompt: str,
+        version: int,
+    ) -> dict[str, Any]:
+        input_items = [
+            {
+                "type": "text",
+                "text": prompt,
+                "text_elements": [],
+            }
+        ]
+        if version == CURRENT_START_TURN_VERSION:
+            params = {
+                "conversationId": thread_id,
+                "turnStart": {
+                    "request": {
+                        "threadId": thread_id,
+                        "input": input_items,
+                    }
+                },
+            }
+        elif version == LEGACY_START_TURN_VERSION:
+            params = {
+                "conversationId": thread_id,
+                "turnStartParams": {
+                    "threadId": thread_id,
+                    "input": input_items,
+                },
+            }
+        else:  # pragma: no cover - internal invariant
+            raise DesktopIpcError("unsupported start-turn IPC version")
+
         connection, client_id = self._connect_initialized()
         try:
             return self._request(
                 connection,
                 method="thread-follower-start-turn",
-                version=1,
+                version=version,
                 source_client_id=client_id,
-                params={
-                    "conversationId": thread_id,
-                    "turnStartParams": {
-                        "threadId": thread_id,
-                        "input": [
-                            {
-                                "type": "text",
-                                "text": prompt,
-                                "text_elements": [],
-                            }
-                        ],
-                    },
-                },
+                params=params,
             )
         finally:
             connection.close()
@@ -238,7 +300,7 @@ class DesktopIpcClient:
                 detail = response.get("error")
                 if not isinstance(detail, str) or not detail:
                     detail = "request-failed"
-                raise DesktopIpcError(f"Desktop IPC {method} failed: {detail}")
+                raise DesktopIpcRequestError(method, detail)
             if response.get("method") != method:
                 raise DesktopIpcError("Desktop IPC response method mismatch")
             result = response.get("result")

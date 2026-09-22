@@ -40,7 +40,8 @@ LoopWeave 仍处于 **pre-alpha** 阶段，适合开发者试用和共同完善�
   `--continue-run <run-id>` 从经过兼容性校验的历史 run 延续同一任务。首次
   派发和续跑都会等待终端输出进入稳定期后再发送，避免 TUI 初始化吞掉早到输入。
 - Agent 可以统一使用 `loopweave submit --stage`、`--final` 或
-  `--needs-human` 提交结果，不依赖 Claude 专属 Hook。
+  `--needs-human` 提交结果，不依赖 Claude 专属 Hook。绑定可见审查的 Run 在调用
+  `submit --stage/--final` 时会自动请求唤醒审查任务；唤醒失败时保留待审卡和错误记录。
 - Codex Desktop 可见审查链路已经通过真实终端验证：阶段提交、审查、
   `changes_requested` 自动发送、同 PID 继续执行、最终提交能够形成完整闭环。
 - 运行存活检查、误判孤立恢复和任务来源都有受约束的审计记录。
@@ -49,10 +50,15 @@ LoopWeave 仍处于 **pre-alpha** 阶段，适合开发者试用和共同完善�
   和身份不确定的 Run 默认受保护。
 - 核心模块在缺少 POSIX 模块的平台上可以安全导入，终端宿主已经抽象为独立平台
   边界。
+- 主审可以使用只读取证助手收集测试、静态检查等证据；助手不能修改被审代码、
+  操作 Run 或提交裁决，最终审查仍由绑定的主审独立完成。
 
 当前边界：
 
 - 可见审查桥目前只支持 Codex Desktop。
+- Desktop 通信优先使用 v2 协议，仅在明确未找到接收客户端时回退 v1；超时等
+  结果不确定的情况不会自动重放。此项兼容修复已覆盖协议测试，仍需在当前桌面端
+  版本完成真实可见唤醒验收；`bridge doctor` 的握手通过不等于唤醒通过。
 - 终端宿主仍使用 POSIX PTY 和 Unix Socket；真实终端验收目前在 macOS 完成。
 - **Windows ConPTY 尚未实现。** Windows 会明确拒绝启动托管终端，不会假装支持。
 - Codex CLI 的沙箱可能在执行 `loopweave submit` 时要求一次本地命令授权；这与
@@ -241,6 +247,7 @@ python -m compileall -q src tests
 
 进一步阅读：
 
+- [更新记录](docs/CHANGELOG.md)
 - [命令参考](docs/CLI_REFERENCE.md)
 - [Run 运维手册](docs/OPERATIONS.md)
 - [迁移与恢复](docs/MIGRATION_AND_RECOVERY.md)

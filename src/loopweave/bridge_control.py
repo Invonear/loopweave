@@ -51,8 +51,17 @@ def build_visible_review_prompt(
             "Write a concise verdict file, then run "
             "`loopweave review-submit "
             f"--run-id {run.run_id} --review-file <file>`.",
-            "Do not create another reviewer or worker. Do not advance a later "
-            "package when requesting changes.",
+            "Do not create a second authoritative reviewer or replacement worker.",
+            "The bound visible reviewer may use a bounded read-only evidence "
+            "helper for tests, static checks, "
+            "screenshots/visual QA, logs, or evidence collection.",
+            "The helper must not modify the reviewed workspace/source, invoke or "
+            "act as `loopweave review-next`/`loopweave review-submit`, write a "
+            "verdict, operate the LoopWeave run/runtime/registry/state, advance "
+            "a package, or replace the reviewer's independent judgment.",
+            "The main reviewer must inspect the real workspace, independently "
+            "verify helper results, and personally submit the sole verdict.",
+            "Do not advance a later package when requesting changes.",
         ]
     )
 

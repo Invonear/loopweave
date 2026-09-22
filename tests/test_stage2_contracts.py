@@ -20,6 +20,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from loopweave.models import RunRecord, RunState
+from loopweave.registry import Registry
+
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 
 # Uses importlib.abc.MetaPathFinder's find_spec() protocol, not the legacy
@@ -1673,6 +1676,28 @@ class SubmitCliContractTests(unittest.TestCase):
     """ADR 0001 section 5: `loopweave submit --stage|--final|--needs-human`
     is a registered subcommand with file-backed summary/evidence input."""
 
+    def _ephemeral_registry(self, root: Path, run_id: str = "run-1") -> Registry:
+        # The generic submit branch now inspects the run to decide whether to
+        # wake a visible reviewer, so the routing contracts provide a minimal
+        # ephemeral run. submit_stage/submit_final stay patched, isolating the
+        # routing assertion from the submission service.
+        registry = Registry(root / "registry.sqlite")
+        registry.create_run(
+            RunRecord(
+                run_id=run_id,
+                codex_thread_id="thread-contract",
+                cwd=str(root),
+                tty="/dev/null",
+                agent="claude",
+                agent_pid=1,
+                agent_process_start="start",
+                control_token="contract-secret",
+                state=RunState.RUNNING,
+                run_dir=str(root / run_id),
+            )
+        )
+        return registry
+
     def test_parser_registers_submit_stage(self) -> None:
         from loopweave.cli import build_parser
 
@@ -1772,8 +1797,11 @@ class SubmitCliContractTests(unittest.TestCase):
             root = Path(directory)
             summary_file = root / "summary.md"
             summary_file.write_text("Implemented the feature.\n", encoding="utf-8")
+            registry = self._ephemeral_registry(root)
 
             with patch("loopweave.cli.submit_stage") as submit_stage, patch(
+                "loopweave.cli._registry", return_value=registry
+            ), patch(
                 "sys.argv",
                 [
                     "loopweave",
@@ -1794,6 +1822,8 @@ class SubmitCliContractTests(unittest.TestCase):
             call_args = submit_stage.call_args
             self.assertEqual(call_args.args[0], "run-1")
             self.assertIn("Implemented the feature.", call_args.args[1])
+            # Ephemeral run: no visible wake-up is attached.
+            self.assertIsNone(call_args.kwargs.get("visible_waker"))
 
     def test_main_submit_needs_human_invokes_submission_service(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1844,8 +1874,11 @@ class SubmitCliContractTests(unittest.TestCase):
                 json.dumps({"files_changed": ["app.py"], "commands_run": []}),
                 encoding="utf-8",
             )
+            registry = self._ephemeral_registry(root)
 
             with patch("loopweave.cli.submit_final") as submit_final, patch(
+                "loopweave.cli._registry", return_value=registry
+            ), patch(
                 "sys.argv",
                 [
                     "loopweave",
@@ -1872,6 +1905,7 @@ class SubmitCliContractTests(unittest.TestCase):
                 call_args.kwargs.get("evidence", {}).get("files_changed"),
                 ["app.py"],
             )
+            self.assertIsNone(call_args.kwargs.get("visible_waker"))
 
     def test_main_submit_uses_environment_run_id_when_flag_omitted(self) -> None:
         """Proves the $LOOPWEAVE_RUN_ID fallback through the real entry
@@ -1884,8 +1918,11 @@ class SubmitCliContractTests(unittest.TestCase):
             root = Path(directory)
             summary_file = root / "summary.md"
             summary_file.write_text("Implemented the feature.\n", encoding="utf-8")
+            registry = self._ephemeral_registry(root, "run-from-env")
 
-            with patch("loopweave.cli.submit_stage") as submit_stage, patch.dict(
+            with patch("loopweave.cli.submit_stage") as submit_stage, patch(
+                "loopweave.cli._registry", return_value=registry
+            ), patch.dict(
                 "os.environ", {"LOOPWEAVE_RUN_ID": "run-from-env"}, clear=False
             ), patch(
                 "sys.argv",

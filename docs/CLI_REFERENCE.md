@@ -165,8 +165,8 @@ loopweave run [--thread THREAD] [--cwd CWD]
 | `--project` | LoopWeave 项目标识 |
 | `--workspace` | Agent 实际工作的目录；必须与 `--project` 一起使用 |
 | `--cwd` | 未使用项目绑定时的工作目录，也用于 Codex 任务发现兼容路径 |
-| `--mode develop` | 允许阶段审查、修改和继续执行 |
-| `--mode design` | 设计型任务模式 |
+| `--mode develop` | 允许多阶段审查（`submit --stage`/`--final`）、修改后继续执行 |
+| `--mode design` | 设计型任务模式；最多 2 轮审查，不承诺多阶段无限复审 |
 | `--reviewer visible-thread` | 使用 Codex Desktop 中可见的审查任务 |
 | `--reviewer ephemeral` | 使用兼容的临时审查后端 |
 | `--task-file` | 启动时原子安装并派发任务包，推荐使用 |
@@ -393,6 +393,13 @@ loopweave submit --needs-human --message-file <message-file>
   截断。
 - 没有 `--run-id` 且环境中没有 `LOOPWEAVE_RUN_ID` 时，命令返回错误。
 - 使用可见审查的 run 必须已经拥有正式任务包。
+- `--stage` 是一次可"审查批准后继续执行"的阶段提交。多阶段续跑（批准 → 修改 → 再提交）
+  由 `develop` 模式支持；`design` 模式最多 2 轮审查，阶段审批不会进入无上限的多阶段续跑。
+  （命令本身不在 submit 路径按模式拒绝 `--stage`；`design` 的轮次上限由审查轮次约束。）
+- 可见审查下，通用 `submit` 与 Claude Stop Hook 走**同一条可见唤醒边界**：任意受管
+  Agent 调用正式 `submit --stage/--final` 都会自动唤醒已绑定的 Codex 可见审查任务，
+  不依赖 Claude Hook。调度失败为 fail-closed——保留唯一待审卡与 `ready_for_review`，
+  并记录有界错误，既不丢卡也不重复建卡。
 
 ## 可见审查命令
 
@@ -484,6 +491,13 @@ loopweave bridge doctor [--json]
 ```
 
 验证绑定、Codex Desktop IPC 和可选空闲观察器状态。失败时不会静默改绑其他任务。
+
+当前可见 turn 调度优先使用 Codex Desktop `thread-follower-start-turn` v2
+信封（`turnStart.request`），仅当 Desktop 明确返回 `no-client-found`、从而能够证明
+没有客户端领取且没有 turn 启动时，才回退到旧版 v1（`turnStartParams`）。读超时、
+连接中断或 `request-timeout` 属于结果不确定状态，绝不自动重放，待审卡仍保留以便
+安全恢复。`bridge doctor` 的 IPC 项只验证只读 initialize 握手；真正的 start-turn
+兼容性由版本化合同测试与下一次真实可见审查 canary 验证。
 
 ### `loopweave bridge unbind`
 

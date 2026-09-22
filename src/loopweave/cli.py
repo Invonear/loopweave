@@ -1819,10 +1819,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if args.evidence_file:
                     from .submission import load_evidence_file
                     evidence = load_evidence_file(Path(args.evidence_file).expanduser())
+                # Vendor-neutral visible wake-up: mirror the Claude Stop Hook
+                # dispatch boundary so any agent calling the official submit
+                # wakes its bound reviewer task, with no Claude hook required.
+                # Non-visible backends never construct the dispatcher.
+                visible_waker = None
+                if registry.get_run(run_id).reviewer_backend is ReviewBackend.VISIBLE_THREAD:
+                    visible_waker = VisibleReviewDispatcher(
+                        controller=_bridge_controller(registry)
+                    )
                 if args.stage:
-                    submit_stage(run_id, summary, evidence=evidence)
+                    submit_stage(run_id, summary, evidence=evidence, visible_waker=visible_waker)
                 else:
-                    submit_final(run_id, summary, evidence=evidence)
+                    submit_final(run_id, summary, evidence=evidence, visible_waker=visible_waker)
             else:
                 message_path = args.message_file
                 if not message_path:

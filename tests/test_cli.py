@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from loopweave.bridge_control import BridgeControlError
 from loopweave.cli import (
     _explicit_thread_id,
     _manual_completion_scope,
@@ -21,6 +22,7 @@ from loopweave.cli import (
     render_runs_json,
     render_status_json,
 )
+from loopweave.hook_entry import handle_claude_stop
 from loopweave.models import (
     ReviewBackend,
     RunMode,
@@ -817,6 +819,262 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertTrue(pending_exists)
+
+    def _running_submit_run(
+        self, root: Path, *, visible: bool = True
+    ) -> tuple[Registry, Path]:
+        registry = Registry(root / "registry.sqlite")
+        run_dir = root / "run-1"
+        run_dir.mkdir()
+        (run_dir / "assigned-task-latest.md").write_text(
+            "# Task\n", encoding="utf-8"
+        )
+        (root / "project.json").write_text(
+            '{"schema_version": 1}\n', encoding="utf-8"
+        )
+        kwargs: dict = dict(
+            run_id="run-1",
+            codex_thread_id="thread-1",
+            cwd=str(root),
+            thread_cwd=str(root),
+            workspace_root=str(root),
+            project_slug="demo",
+            project_root=str(root),
+            tty="/dev/test",
+            agent="claude",
+            agent_pid=123,
+            agent_process_start="start",
+            control_token="secret",
+            state=RunState.RUNNING,
+            run_dir=str(run_dir),
+            reviewer_backend=(
+                ReviewBackend.VISIBLE_THREAD if visible else ReviewBackend.EPHEMERAL
+            ),
+        )
+        if visible:
+            kwargs["reviewer_thread_id"] = "thread-1"
+            kwargs["reviewer_thread_cwd"] = str(root)
+        registry.create_run(RunRecord(**kwargs))
+        return registry, run_dir
+
+    def _identity_patch(self):
+        return patch(
+            "loopweave.terminal_host.default_process_identity_reader",
+            return_value=lambda pid: "start",
+        )
+
+    def test_submit_stage_visible_thread_wakes_reviewer(self) -> None:
+        # Generic `submit --stage` for a visible-thread run must dispatch
+        # through VisibleReviewDispatcher (the same boundary the Claude Stop
+        # Hook uses), not only enqueue the card. Vendor-neutral: any agent
+        # calling the official submit gets the wake-up, no Claude hook needed.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry, run_dir = self._running_submit_run(root)
+            summary_file = root / "summary.md"
+            summary_file.write_text("Stage 1 complete.", encoding="utf-8")
+
+            with patch(
+                "loopweave.cli._registry", return_value=registry
+            ), patch(
+                "loopweave.submission._registry", return_value=registry
+            ), self._identity_patch(), patch(
+                "loopweave.cli.VisibleReviewDispatcher"
+            ) as dispatcher_cls:
+                code = main(
+                    [
+                        "submit",
+                        "--run-id",
+                        "run-1",
+                        "--stage",
+                        "--summary-file",
+                        str(summary_file),
+                    ]
+                )
+            events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+            final_state = registry.get_run("run-1").state
+
+        self.assertEqual(code, 0)
+        dispatcher_cls.assert_called_once()
+        dispatcher_cls.return_value.assert_called_once()
+        self.assertIn("visible_review_card_queued", events)
+        self.assertIn("visible_review_dispatch_attempted", events)
+        self.assertEqual(final_state, RunState.READY_FOR_REVIEW)
+
+    def test_submit_final_visible_thread_wakes_reviewer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry, run_dir = self._running_submit_run(root)
+            summary_file = root / "summary.md"
+            summary_file.write_text("All work complete.", encoding="utf-8")
+
+            with patch(
+                "loopweave.cli._registry", return_value=registry
+            ), patch(
+                "loopweave.submission._registry", return_value=registry
+            ), self._identity_patch(), patch(
+                "loopweave.cli.VisibleReviewDispatcher"
+            ) as dispatcher_cls:
+                code = main(
+                    [
+                        "submit",
+                        "--run-id",
+                        "run-1",
+                        "--final",
+                        "--summary-file",
+                        str(summary_file),
+                    ]
+                )
+            events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+            # The card records the final completion scope, not a stage.
+            card_ids = list((run_dir / "review-inbox").glob("review-request-*.json"))
+            card_scope = (
+                json.loads(card_ids[0].read_text(encoding="utf-8"))["completion_scope"]
+                if card_ids
+                else None
+            )
+
+        self.assertEqual(code, 0)
+        dispatcher_cls.assert_called_once()
+        dispatcher_cls.return_value.assert_called_once()
+        self.assertIn("visible_review_dispatch_attempted", events)
+        self.assertEqual(len(card_ids), 1)
+        self.assertEqual(card_scope, "final")
+
+    def test_submit_visible_dispatch_failure_preserves_unique_pending_card(
+        self,
+    ) -> None:
+        # Fail-closed: when the wake-up itself raises (e.g. reviewer binding
+        # problem), the unique pending card and ready_for_review state remain
+        # recoverable; a bounded failure is recorded, not a lost card.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry, run_dir = self._running_submit_run(root)
+            summary_file = root / "summary.md"
+            summary_file.write_text("Stage done.", encoding="utf-8")
+
+            with patch(
+                "loopweave.cli._registry", return_value=registry
+            ), patch(
+                "loopweave.submission._registry", return_value=registry
+            ), self._identity_patch(), patch(
+                "loopweave.cli.VisibleReviewDispatcher"
+            ) as dispatcher_cls:
+                dispatcher_cls.return_value.side_effect = BridgeControlError(
+                    "visible reviewer task is not bound"
+                )
+                code = main(
+                    [
+                        "submit",
+                        "--run-id",
+                        "run-1",
+                        "--stage",
+                        "--summary-file",
+                        str(summary_file),
+                    ]
+                )
+            events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+            final_state = registry.get_run("run-1").state
+            card_files = list((run_dir / "review-inbox").glob("review-request-*.json"))
+            pending_exists = (run_dir / "review-inbox" / "pending").exists()
+
+        self.assertEqual(code, 0)
+        dispatcher_cls.return_value.assert_called_once()
+        self.assertIn("visible_review_dispatch_failed", events)
+        self.assertIn("visible_review_dispatch_attempted", events)
+        self.assertIn("queued_after_dispatch_failure", events)
+        self.assertEqual(final_state, RunState.READY_FOR_REVIEW)
+        # Exactly one recoverable pending card, never duplicated or dropped.
+        self.assertEqual(len(card_files), 1)
+        self.assertTrue(pending_exists)
+
+    def test_submit_ephemeral_backend_does_not_wake_reviewer(self) -> None:
+        # Non-visible backends must not construct or invoke the visible
+        # dispatcher; they keep using the ephemeral dispatch pipeline.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry, run_dir = self._running_submit_run(root, visible=False)
+            summary_file = root / "summary.md"
+            summary_file.write_text("Stage done.", encoding="utf-8")
+
+            with patch(
+                "loopweave.cli._registry", return_value=registry
+            ), patch(
+                "loopweave.submission._registry", return_value=registry
+            ), self._identity_patch(), patch(
+                "loopweave.cli.VisibleReviewDispatcher"
+            ) as dispatcher_cls, patch(
+                "loopweave.submission._dispatch"
+            ) as ephemeral_dispatch:
+                code = main(
+                    [
+                        "submit",
+                        "--run-id",
+                        "run-1",
+                        "--stage",
+                        "--summary-file",
+                        str(summary_file),
+                    ]
+                )
+            final_state = registry.get_run("run-1").state
+
+        self.assertEqual(code, 0)
+        dispatcher_cls.assert_not_called()
+        ephemeral_dispatch.assert_called_once()
+        self.assertEqual(final_state, RunState.READY_FOR_REVIEW)
+
+    def test_submit_visible_then_stop_hook_does_not_redispatch(self) -> None:
+        # Exactly-once across the two wake-up paths: after the generic submit
+        # has dispatched the visible card, the Claude Stop Hook observing the
+        # now-ready run must NOT dispatch again or overwrite the card.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            registry, run_dir = self._running_submit_run(root)
+            summary_file = root / "summary.md"
+            summary_file.write_text("Stage done.", encoding="utf-8")
+
+            with patch(
+                "loopweave.cli._registry", return_value=registry
+            ), patch(
+                "loopweave.submission._registry", return_value=registry
+            ), self._identity_patch(), patch(
+                "loopweave.cli.VisibleReviewDispatcher"
+            ) as dispatcher_cls:
+                code = main(
+                    [
+                        "submit",
+                        "--run-id",
+                        "run-1",
+                        "--stage",
+                        "--summary-file",
+                        str(summary_file),
+                    ]
+                )
+                stop_wakeups = []
+                stop_dispatched = []
+                stop_result = handle_claude_stop(
+                    "run-1",
+                    {
+                        "last_assistant_message": "LOOPWEAVE_STAGE\nDone.",
+                        "transcript_path": str(root / "missing.jsonl"),
+                    },
+                    registry,
+                    lambda run: stop_dispatched.append(run.run_id),
+                    visible_waker=lambda run, card: stop_wakeups.append(
+                        card["review_id"]
+                    ),
+                )
+            events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+            card_files = list((run_dir / "review-inbox").glob("review-request-*.json"))
+
+        self.assertEqual(code, 0)
+        self.assertEqual(stop_result, "ready_for_review")
+        self.assertEqual(stop_wakeups, [])
+        self.assertEqual(stop_dispatched, [])
+        # The CLI dispatched exactly once; the Stop Hook did not add a card.
+        dispatcher_cls.return_value.assert_called_once()
+        self.assertEqual(len(card_files), 1)
+        self.assertIn("stop_hook_ignored_ready_for_review", events)
 
     def test_main_finalize_forwards_owner_global_verdict(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

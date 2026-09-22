@@ -10,10 +10,12 @@ from loopweave.bridge_control import (
     BridgeController,
     BridgeControlError,
     VisibleReviewDispatcher,
+    build_visible_review_prompt,
 )
 from loopweave.desktop_ipc import DesktopIpcError
 from loopweave.models import ReviewBackend, RunRecord, RunState
 from loopweave.registry import Registry
+from loopweave.submission import submit_stage
 
 
 THREAD = "11111111-1111-4111-8111-111111111111"
@@ -226,6 +228,56 @@ def test_dispatcher_starts_exactly_one_turn_for_idle_owner(tmp_path: Path):
     assert "review-submit --run-id run-one --review-file <file>" in prompt
 
 
+def test_visible_review_prompt_has_bounded_evidence_helper_contract(
+    tmp_path: Path,
+) -> None:
+    run = _registry(tmp_path).get_run("run-one")
+    prompt = build_visible_review_prompt(
+        run,
+        {
+            "review_id": "review-request-one",
+            "completion_scope": "stage",
+        },
+        "[LOOPWEAVE_VISIBLE_REVIEW review_id=review-request-one generation=1]",
+    )
+
+    assert (
+        "Do not create a second authoritative reviewer or replacement worker."
+        in prompt
+    )
+    assert (
+        "The bound visible reviewer may use a bounded read-only evidence helper "
+        "for tests, static checks, "
+    ) in prompt
+    for allowed in (
+        "tests",
+        "static checks",
+        "screenshots/visual QA",
+        "logs",
+        "evidence collection",
+    ):
+        assert allowed in prompt
+
+    helper_restrictions = (
+        "The helper must not modify the reviewed workspace/source",
+        "act as `loopweave review-next`/`loopweave review-submit`",
+        "write a verdict",
+        "operate the LoopWeave run/runtime/registry/state",
+        "advance a package",
+        "replace the reviewer's independent judgment",
+    )
+    for restriction in helper_restrictions:
+        assert restriction in prompt
+
+    assert (
+        "The main reviewer must inspect the real workspace, independently "
+        "verify helper results, and personally submit the sole verdict."
+    ) in prompt
+    # Guard the old absolute policy so a future edit cannot silently remove
+    # the explicitly bounded evidence-helper allowance.
+    assert "Do not create another reviewer or worker." not in prompt
+
+
 def test_dispatcher_orphans_dead_pending_run_before_unique_delivery(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -350,3 +402,84 @@ def test_dispatcher_does_not_ack_when_desktop_has_no_owner(tmp_path: Path):
     )
     assert lease.state == "dispatching"
     assert len(ipc.calls) == 1
+
+
+def _bound_visible_submit_env(
+    tmp_path: Path,
+    *,
+    ipc_error: DesktopIpcError | None,
+):
+    registry = _registry(tmp_path)
+    sessions = tmp_path / "sessions"
+    controller = BridgeController(
+        root=tmp_path, registry=registry, sessions_dir=sessions
+    )
+    controller.bind(thread_id=THREAD, thread_cwd=str(tmp_path), run_id="run-one")
+    run_dir = Path(registry.get_run("run-one").run_dir)
+    (run_dir / "assigned-task-latest.md").write_text("# Task\n", encoding="utf-8")
+    (run_dir / "run.json").write_text("{}\n", encoding="utf-8")
+    _write_reviewer_session(sessions, active=False)
+    return registry, controller, run_dir, FakeDesktopIpc(ipc_error)
+
+
+def test_submit_stage_drives_real_dispatcher_visible_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The generic submit path drives the REAL VisibleReviewDispatcher through
+    # the same bridge boundary as the Claude Stop Hook, delivering one visible
+    # turn to the bound reviewer task.
+    registry, controller, run_dir, ipc = _bound_visible_submit_env(
+        tmp_path, ipc_error=None
+    )
+    monkeypatch.setattr(
+        "loopweave.terminal_host.default_process_identity_reader",
+        lambda: lambda pid: "now",
+    )
+
+    submit_stage(
+        "run-one",
+        "Stage complete; focused tests pass.",
+        evidence={"commands_run": ["python -m pytest"]},
+        registry=registry,
+        visible_waker=VisibleReviewDispatcher(controller=controller, ipc_client=ipc),
+    )
+
+    events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+    assert len(ipc.calls) == 1
+    assert "run_id: run-one" in ipc.calls[0][1]
+    assert "visible_review_dispatch_attempted" in events
+    assert "visible_review_desktop_turn_started" in events
+    assert registry.get_run("run-one").state is RunState.READY_FOR_REVIEW
+
+
+def test_submit_stage_real_dispatcher_ipc_failure_keeps_pending_card(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Desktop IPC failure during the real submit dispatch is fail-closed: the
+    # unique pending card and ready_for_review state stay recoverable, with a
+    # bounded desktop-dispatch-failed event recorded.
+    registry, controller, run_dir, ipc = _bound_visible_submit_env(
+        tmp_path, ipc_error=DesktopIpcError("no desktop client")
+    )
+    monkeypatch.setattr(
+        "loopweave.terminal_host.default_process_identity_reader",
+        lambda: lambda pid: "now",
+    )
+
+    submit_stage(
+        "run-one",
+        "Stage complete.",
+        evidence={},
+        registry=registry,
+        visible_waker=VisibleReviewDispatcher(controller=controller, ipc_client=ipc),
+    )
+
+    events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+    assert len(ipc.calls) == 1  # real dispatcher reached the IPC layer
+    assert "visible_review_dispatch_attempted" in events
+    assert "visible_review_desktop_dispatch_failed" in events
+    assert registry.get_run("run-one").state is RunState.READY_FOR_REVIEW
+    assert (run_dir / "review-inbox" / "pending").exists()
+    assert (
+        len(list((run_dir / "review-inbox").glob("review-request-*.json"))) == 1
+    )
